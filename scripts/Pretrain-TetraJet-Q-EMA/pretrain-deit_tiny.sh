@@ -1,5 +1,5 @@
 SCRIPT_PATH=$(pwd)
-DATA_PATH="dataset/imagenet"    # Dataset Path
+DATA_PATH="/sharedspace/data/imagenet"    # Dataset Path
 WORK_PATH="../../"
 PATH_TO_SAVE="."                 # NEED: Path to save checkpoints
 
@@ -17,7 +17,7 @@ cd "$WORK_PATH"
 mkdir -p $SCRIPT_PATH/${LOGS_NAME}
 
 # nproc_per_node: how many gpus to run on
-python -m torch.distributed.run --nproc_per_node=4 --master_port=29501 main.py \
+CUDA_VISIBLE_DEVICES=4,5,6,7 python -m torch.distributed.run --nproc_per_node=4 --master_port=29501 main.py \
     --model ${MODEL_NAME}_patch16_224 \
     --batch-size 256 \
     --tritonQ \

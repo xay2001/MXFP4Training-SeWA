@@ -1,5 +1,5 @@
 SCRIPT_PATH=$(pwd)
-DATA_PATH="dataset/imagenet"    # Dataset Path
+DATA_PATH="/sharedspace/data/imagenet"    # Dataset Path
 WORK_PATH="../../"
 PATH_TO_SAVE="."                 # NEED: Path to save checkpoints
 
