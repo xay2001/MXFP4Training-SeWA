@@ -251,6 +251,14 @@ def get_args_parser():
     group.add_argument('--qlinear-all',     action='store_true', default=False, help='Enable all quantization in Linear.')
     
     group.add_argument('--qlinear-ema-decay', type=float, default=0, help="Qlinear weight ema decay for Quantize")
+    group.add_argument('--qlinear-osmq', action='store_true', default=False,
+                       help='Enable Online Selective Masked Quantization for forward weights.')
+    group.add_argument('--qlinear-osmq-start-step', type=int, default=0,
+                       help='Training step to start OSMQ after EMA warmup.')
+    group.add_argument('--qlinear-osmq-tau', type=float, default=1.0,
+                       help='Gumbel-Softmax temperature for OSMQ masks.')
+    group.add_argument('--qlinear-osmq-init-current-bias', type=float, default=1.0,
+                       help='Initial logit bias for the current-quantization candidate.')
     
     return parser
 

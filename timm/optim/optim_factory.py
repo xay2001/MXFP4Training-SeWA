@@ -29,7 +29,7 @@ def add_weight_decay(model, weight_decay=1e-5, skip_list=()):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue  # frozen weights
-        if len(param.shape) == 1 or name.endswith(".bias") or name in skip_list:
+        if len(param.shape) == 1 or name.endswith(".bias") or name.endswith("mask_logit") or name in skip_list:
             no_decay.append(param)
         else:
             decay.append(param)
