@@ -3,7 +3,9 @@
 """
 Train and eval functions used in main.py
 """
+import json
 import math
+import os
 import sys
 from contextlib import nullcontext
 from typing import Iterable, Optional
@@ -69,6 +71,39 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         return any(module._osmq_ready() for module in osmq_modules())
 
     base_model = model.module if hasattr(model, 'module') else model
+
+    scale_monitor = getattr(args, 'qlinear_scale_monitor', False)
+    scale_monitor_interval = max(1, getattr(args, 'qlinear_scale_monitor_interval', 500))
+    scale_monitor_path = getattr(args, 'qlinear_scale_monitor_path', '') or \
+        os.path.join(args.output_dir, 'scale_monitor.jsonl')
+    if getattr(args, 'qlinear_scale_sewa', False):
+        scale_monitor_method = 'scale_sewa'
+    elif getattr(args, 'qlinear_osmq', False):
+        scale_monitor_method = 'osmq'
+    else:
+        scale_monitor_method = 'qema'
+    if scale_monitor and utils.is_main_process():
+        os.makedirs(os.path.dirname(scale_monitor_path), exist_ok=True)
+
+    def write_scale_monitor(global_step):
+        if not (scale_monitor and utils.is_main_process()):
+            return
+        layers = {}
+        for name, module in base_model.named_modules():
+            if isinstance(module, QLinearLayer):
+                stats = module.collect_scale_stats()
+                if stats is not None:
+                    layers[name] = stats
+        if not layers:
+            return
+        record = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "method": scale_monitor_method,
+            "layers": layers,
+        }
+        with open(scale_monitor_path, 'a') as f:
+            f.write(json.dumps(record) + "\n")
     
     for step, (samples, targets) in metric_logger.log_every(data_loader, print_freq, header):
         if "BSRamping" in args.opt and step % CALIBRATE_PERIOD == 0:
@@ -183,8 +218,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         }
         if scale_loss_value is not None:
             step_summary["scale_loss"] = scale_loss_value
-        DLLogger.log(step=epoch * len(data_loader) + step,
+        global_step = epoch * len(data_loader) + step
+        DLLogger.log(step=global_step,
                      data=step_summary, verbosity=0)
+
+        if scale_monitor and (global_step % scale_monitor_interval == 0):
+            write_scale_monitor(global_step)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

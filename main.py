@@ -269,6 +269,12 @@ def get_args_parser():
                        help='Learning rate for the Scale-SeWA optimizer. Negative means using the main lr.')
     group.add_argument('--qlinear-scale-update-interval', type=int, default=1,
                        help='Update Scale-SeWA optimizer and history every N training steps.')
+    group.add_argument('--qlinear-scale-monitor', action='store_true', default=False,
+                       help='Log read-only per-layer scale statistics to a jsonl file (no effect on training).')
+    group.add_argument('--qlinear-scale-monitor-interval', type=int, default=500,
+                       help='Collect scale monitoring statistics every N global training steps.')
+    group.add_argument('--qlinear-scale-monitor-path', type=str, default='',
+                       help='Path to the scale monitor jsonl file. Empty means <output_dir>/scale_monitor.jsonl.')
     
     return parser
 

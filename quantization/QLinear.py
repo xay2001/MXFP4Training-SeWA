@@ -140,12 +140,16 @@ class QLinearLayer(nn.Linear):
         if self.args.fwbit == 16:
             return input.to(torch.bfloat16), input.to(torch.bfloat16)
 
-        elow, _, mhigh, qmin, qmax = self._fp_quant_params(self.args.fwbit, self.args.fwexp)
+        elow, ehigh, mhigh, qmin, qmax = self._fp_quant_params(self.args.fwbit, self.args.fwexp)
         x = input / scale
         sign = x.sign()
         x_abs = x.abs()
         expo = torch.floor(torch.log2(x_abs + self.args.epsilon))
-        expo = torch.clamp(expo, min=elow)
+        # Unlike the standard path, `scale` here is selected_scale (a convex mix of
+        # history candidates), so x is NOT guaranteed normalized. Without an upper
+        # clamp, a too-small selected_scale makes 2**expo overflow to inf -> inf*0=NaN
+        # -> NaN into the GEMM -> GPU driver crash. Clamp to ehigh (MXFP saturation).
+        expo = torch.clamp(expo, min=elow, max=ehigh)
 
         if ema_input is None:
             mant = x_abs / (2 ** expo)
@@ -191,6 +195,57 @@ class QLinearLayer(nn.Linear):
                 self.wscale_history[:, 1].copy_(self.wscale_history[:, 0])
                 self.wscale_history[:, 0].copy_(scale)
             self.scale_history_step.add_(1)
+
+    @torch.no_grad()
+    def collect_scale_stats(self):
+        """Read-only scale statistics for monitoring.
+
+        Strictly side-effect free: no RNG (no Gumbel), no triton kernels,
+        no buffer writes, no autograd graph. Safe to call mid-training without
+        affecting accuracy. Returns None for layers without quantized scale.
+        """
+        if not (self.apply_quantize and getattr(self, 'is_ema', False)):
+            return None
+
+        Bweight = block_cut(self.weight, self.args.row_blocksize, self.args.column_blocksize)
+        s_t = self._compute_fp_scale(Bweight).detach()
+        log2_s = torch.log2(s_t.clamp_min(1e-30)).flatten().float()
+        stats = {
+            "num_blocks": int(log2_s.numel()),
+            "scale_log2_mean": log2_s.mean().item(),
+            "scale_log2_std": log2_s.std(unbiased=False).item(),
+            "scale_log2_min": log2_s.min().item(),
+            "scale_log2_max": log2_s.max().item(),
+        }
+
+        if self.is_scale_sewa:
+            scale_history = self.wscale_history.to(Bweight).detach()
+            scale_candidates = torch.stack(
+                (s_t, scale_history[:, 0], scale_history[:, 1], scale_history[:, 3]),
+                dim=1)
+            cand = scale_candidates.flatten(1).float()
+            cmax = cand.max(dim=1).values
+            cmin = cand.min(dim=1).values
+            stats["cand_all_equal_ratio"] = (cmax == cmin).float().mean().item()
+
+            log2c = torch.log2(cand.clamp_min(1e-30))
+            pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+            dist = torch.stack([(log2c[:, i] - log2c[:, j]).abs() for i, j in pairs], dim=1)
+            stats["cand_pairwise_log2_dist_mean"] = dist.mean().item()
+
+            # Deterministic softmax (NO Gumbel / NO rng) just for read-out.
+            tau = max(getattr(self.args, 'qlinear_scale_sewa_tau', 1.0), 1e-6)
+            probs = F.softmax(self.scale_mask_logit / tau, dim=-1)
+            argmax = probs.argmax(dim=-1)
+            stats["argmax_ratio"] = [(argmax == k).float().mean().item() for k in range(4)]
+            ent = -(probs.clamp_min(1e-12).log() * probs).sum(dim=-1)
+            stats["entropy_mean"] = ent.mean().item()
+
+            selected = (probs.view(probs.shape[0], 4, 1, 1) * scale_candidates).sum(dim=1)
+            stats["selected_eq_current_ratio"] = (
+                selected.flatten() == s_t.flatten()).float().mean().item()
+
+        return stats
 
     def _standard_rqweight(self, ema_weight=None):
         with torch.no_grad():
