@@ -4,25 +4,34 @@ WORK_PATH="../../"
 PATH_TO_SAVE="."                 # NEED: Path to save checkpoints
 
 MODEL_NAME="deit_tiny"          # Model name in ["deit_tiny", "deit_small", "deit_base"]
-                                # NOTE: "deit_base" needs a different Learning-Rate & Batch-Size setting
 OMP_NUM_THREADS=8
 
 EMA_DECAY=0.9983
-OSMQ_START_STEP=50000
+# 4 GPUs: ~1250 steps/epoch, 50000 starts around epoch 40.
+OSMQ_START_STEP=${OSMQ_START_STEP:-50000}
 OSMQ_TAU=1.0
 SCALE_SEWA_TAU=1.0
 SCALE_SEWA_CURRENT_BIAS=1.0
 SCALE_UPDATE_INTERVAL=8
-Experiment_NAME="TetraJet-MXFP4-OSMQ-ScaleHistory-EMA${EMA_DECAY}-S${OSMQ_START_STEP}-ST${SCALE_SEWA_TAU}-SI${SCALE_UPDATE_INTERVAL}"
+GPUS=${GPUS:-0,1,2,3}
+NPROC_PER_NODE=${NPROC_PER_NODE:-4}
+MASTER_PORT=${MASTER_PORT:-29505}
+Experiment_NAME="TetraJet-MXFP4-OSMQ-ScaleHistory-EMA${EMA_DECAY}-S${OSMQ_START_STEP}-ST${SCALE_SEWA_TAU}-SI${SCALE_UPDATE_INTERVAL}-4GPU"
 LOGS_NAME="logs_${Experiment_NAME}_${MODEL_NAME}"
 SAVE_PATH="${PATH_TO_SAVE}/${Experiment_NAME}/${MODEL_NAME}"
+
+# NCCL stability: long enough timeout so the outer-pass AllReduce never blocks
+# longer than the per-step Triton compile/load on first iterations.
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export NCCL_TIMEOUT=7200
 
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 cd "$WORK_PATH"
 mkdir -p $SCRIPT_PATH/${LOGS_NAME}
 
-# nproc_per_node: how many gpus to run on
-CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 --master_port=29505 main.py \
+CUDA_VISIBLE_DEVICES=${GPUS} python -u -m torch.distributed.run --nproc_per_node=${NPROC_PER_NODE} --master_port=${MASTER_PORT} main.py \
     --model ${MODEL_NAME}_patch16_224 \
     --batch-size 256 \
     --tritonQ \
