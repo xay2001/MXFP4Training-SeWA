@@ -127,3 +127,4 @@
 {"train_lr": 0.00025750000000000143, "train_loss": 4.608871856038805, "train_scale_loss": 4.584760212974184, "test_loss": 1.9786277991168353, "test_acc1": 56.146, "test_acc5": 80.496, "epoch": 61, "n_parameters": 6878632}
 {"train_lr": 0.00024268996420456657, "train_loss": 4.592531246771153, "train_scale_loss": 4.559717986234434, "test_loss": 1.965829467286869, "test_acc1": 56.572, "test_acc5": 80.674, "epoch": 62, "n_parameters": 6878632}
 {"train_lr": 0.00022819951278197403, "train_loss": 4.575095870845514, "train_scale_loss": 4.544046075860406, "test_loss": 1.9635400513605195, "test_acc1": 56.826, "test_acc5": 80.7, "epoch": 63, "n_parameters": 6878632}
+{"train_lr": 0.0002140463001152288, "train_loss": 4.57703766367323, "train_scale_loss": 4.559679639187588, "test_loss": 1.946426059822647, "test_acc1": 56.944, "test_acc5": 80.952, "epoch": 64, "n_parameters": 6878632}
