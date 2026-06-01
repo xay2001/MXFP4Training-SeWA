@@ -259,6 +259,16 @@ def get_args_parser():
                        help='Gumbel-Softmax temperature for OSMQ masks.')
     group.add_argument('--qlinear-osmq-init-current-bias', type=float, default=1.0,
                        help='Initial logit bias for the current-quantization candidate.')
+    group.add_argument('--qlinear-scale-sewa', action='store_true', default=False,
+                       help='Enable SeWA-style soft selection and averaging over MXFP history scale candidates.')
+    group.add_argument('--qlinear-scale-sewa-tau', type=float, default=1.0,
+                       help='Gumbel-Softmax temperature for Scale-SeWA scale weights.')
+    group.add_argument('--qlinear-scale-sewa-init-current-bias', type=float, default=1.0,
+                       help='Initial logit bias for the current-scale candidate in [s_t, s_t-1, s_t-2, s_t-4].')
+    group.add_argument('--qlinear-scale-lr', type=float, default=-1.0,
+                       help='Learning rate for the Scale-SeWA optimizer. Negative means using the main lr.')
+    group.add_argument('--qlinear-scale-update-interval', type=int, default=1,
+                       help='Update Scale-SeWA optimizer and history every N training steps.')
     
     return parser
 
@@ -432,7 +442,11 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[args.gpu],
+            broadcast_buffers=False,
+        )
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -441,7 +455,20 @@ def main(args):
     if not args.unscale_lr:
         linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
         args.lr = linear_scaled_lr
+    scale_params = []
+    if args.qlinear_scale_sewa:
+        scale_params = [p for n, p in model_without_ddp.named_parameters()
+                        if p.requires_grad and n.endswith("scale_mask_logit")]
+        for p in scale_params:
+            p.requires_grad_(False)
     optimizer = create_optimizer(args, model_without_ddp)
+    for p in scale_params:
+        p.requires_grad_(True)
+    scale_optimizer = None
+    if len(scale_params) > 0:
+        scale_lr = args.qlinear_scale_lr if args.qlinear_scale_lr > 0 else args.lr
+        scale_optimizer = torch.optim.AdamW(scale_params, lr=scale_lr, weight_decay=0.0)
+        print(f"Using Scale-SeWA optimizer: AdamW, lr={scale_lr}, params={sum(p.numel() for p in scale_params)}")
     loss_scaler = NativeScaler()
 
     lr_scheduler, _ = create_scheduler(args, optimizer)
@@ -495,6 +522,8 @@ def main(args):
         model_without_ddp.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
+            if scale_optimizer is not None and checkpoint.get('scale_optimizer') is not None:
+                scale_optimizer.load_state_dict(checkpoint['scale_optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             args.start_epoch = checkpoint['epoch'] + 1
             if args.model_ema:
@@ -541,7 +570,8 @@ def main(args):
             args.clip_grad, model_ema, mixup_fn,
             set_training_mode=args.train_mode,  # keep in eval mode for deit finetuning / train mode for training and deit III finetuning
             args = args,
-            calib_data_loader = data_loader_calib
+            calib_data_loader = data_loader_calib,
+            scale_optimizer = scale_optimizer
         )
 
         lr_scheduler.step(epoch)
@@ -552,6 +582,7 @@ def main(args):
                 utils.save_on_master({
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
+                    'scale_optimizer': scale_optimizer.state_dict() if scale_optimizer is not None else None,
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'model_ema': get_state_dict(model_ema),
@@ -572,6 +603,7 @@ def main(args):
                     utils.save_on_master({
                         'model': model_without_ddp.state_dict(),
                         'optimizer': optimizer.state_dict(),
+                        'scale_optimizer': scale_optimizer.state_dict() if scale_optimizer is not None else None,
                         'lr_scheduler': lr_scheduler.state_dict(),
                         'epoch': epoch,
                         'model_ema': get_state_dict(model_ema),

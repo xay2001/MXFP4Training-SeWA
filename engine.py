@@ -5,6 +5,7 @@ Train and eval functions used in main.py
 """
 import math
 import sys
+from contextlib import nullcontext
 from typing import Iterable, Optional
 
 import torch
@@ -26,7 +27,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
                     set_training_mode=True, args = None,
-                    calib_data_loader: Optional[Iterable] = None):
+                    calib_data_loader: Optional[Iterable] = None,
+                    scale_optimizer: Optional[torch.optim.Optimizer] = None):
     model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -45,6 +47,28 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         max_step = CALIBRATE_PERIOD
     
     output_dir = Path(args.output_dir)
+    scale_update_interval = max(1, getattr(args, 'qlinear_scale_update_interval', 1))
+    scale_params = []
+    if scale_optimizer is not None:
+        for group in scale_optimizer.param_groups:
+            scale_params.extend(group['params'])
+
+    def set_scale_mode(optimize, update_history):
+        for module in osmq_modules():
+            if getattr(module, 'is_scale_sewa', False):
+                module.optimize_scale_sewa = optimize
+                module.update_scale_history = update_history
+
+    def osmq_modules():
+        base_model = model.module if hasattr(model, 'module') else model
+        for module in base_model.modules():
+            if isinstance(module, QLinearLayer) and getattr(module, 'is_osmq', False):
+                yield module
+
+    def osmq_is_ready():
+        return any(module._osmq_ready() for module in osmq_modules())
+
+    base_model = model.module if hasattr(model, 'module') else model
     
     for step, (samples, targets) in metric_logger.log_every(data_loader, print_freq, header):
         if "BSRamping" in args.opt and step % CALIBRATE_PERIOD == 0:
@@ -66,6 +90,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         if args.bce_loss:
             targets = targets.gt(0.0).type(targets.dtype)
          
+        set_scale_mode(optimize=False, update_history=True)
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             outputs = model(samples)
             if not args.cosub:
@@ -84,6 +109,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             sys.exit(1)
 
         optimizer.zero_grad()
+        if scale_optimizer is not None:
+            scale_optimizer.zero_grad()
 
         # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
@@ -95,18 +122,67 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             model_ema.update(model)
         
         if args.qlinear_ema_decay > 0:         # EMA-Weight Update
-            for name, module in model.module.named_modules():
+            for name, module in base_model.named_modules():
                 if isinstance(module, QLinearLayer):
                     if module.training and module.apply_quantize and module.is_ema:
                         module.ema_step += 1
                         module.ema_weight.mul_(module.ema_decay).add_(module.weight.data, alpha = 1 - module.ema_decay)
 
+        scale_loss_value = None
+        if scale_optimizer is not None and osmq_is_ready() and (step % scale_update_interval == 0):
+            optimizer.zero_grad()
+            scale_optimizer.zero_grad()
+            set_scale_mode(optimize=True, update_history=False)
+            # no_sync() blocks DDP from AllReducing the entire model's grads on the
+            # outer pass; we manually sync only scale_params below.
+            sync_context = model.no_sync() if hasattr(model, 'no_sync') else nullcontext()
+            with sync_context:
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    scale_outputs = model(samples)
+                    if not args.cosub:
+                        scale_loss = criterion(samples, scale_outputs, targets)
+                    else:
+                        scale_outputs = torch.split(scale_outputs, scale_outputs.shape[0]//2, dim=0)
+                        scale_loss = 0.25 * criterion(scale_outputs[0], targets)
+                        scale_loss = scale_loss + 0.25 * criterion(scale_outputs[1], targets)
+                        scale_loss = scale_loss + 0.25 * criterion(scale_outputs[0], scale_outputs[1].detach().sigmoid())
+                        scale_loss = scale_loss + 0.25 * criterion(scale_outputs[1], scale_outputs[0].detach().sigmoid())
+
+                scale_loss_value = scale_loss.item()
+                if not math.isfinite(scale_loss_value):
+                    print("Scale loss is {}, stopping training".format(scale_loss_value))
+                    sys.exit(1)
+                scale_loss.backward()
+
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                world_size = float(dist.get_world_size())
+                handles = []
+                for p in scale_params:
+                    if p.grad is not None:
+                        handles.append(dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, async_op=True))
+                for h in handles:
+                    h.wait()
+                for p in scale_params:
+                    if p.grad is not None:
+                        p.grad.div_(world_size)
+
+            if max_norm is not None and max_norm > 0:
+                torch.nn.utils.clip_grad_norm_(scale_params, max_norm)
+
+            scale_optimizer.step()
+            set_scale_mode(optimize=False, update_history=True)
+            optimizer.zero_grad()
+
         metric_logger.update(loss=loss_value)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        if scale_loss_value is not None:
+            metric_logger.update(scale_loss=scale_loss_value)
 
         step_summary = {
             "loss": loss.item(),
         }
+        if scale_loss_value is not None:
+            step_summary["scale_loss"] = scale_loss_value
         DLLogger.log(step=epoch * len(data_loader) + step,
                      data=step_summary, verbosity=0)
 
