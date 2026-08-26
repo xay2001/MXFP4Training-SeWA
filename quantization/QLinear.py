@@ -7,6 +7,7 @@ from .Qconfig import qconfig
 from .utils import *
 from .QFunction import *
 
+import math
 import os
 from copy import deepcopy
 
@@ -54,6 +55,151 @@ class QLinearLayer(nn.Linear):
                 self.register_buffer('scale_history_step', torch.tensor(0, dtype=torch.long))
         else:
             self.is_scale_sewa = False
+
+        # Delayed Future-Utility Reset (DFUR): keep Q-EMA as the deployed
+        # quantizer, but learn online whether resetting a recently oscillating
+        # block to its deployed FP4 value is expected to reduce the next-batch
+        # loss.  All state is buffered, so it is checkpointed without adding
+        # inference-time parameters.
+        self.is_future_utility_reset = (
+            self.apply_quantize
+            and getattr(args, 'qlinear_future_utility_reset', False)
+        )
+        if self.is_future_utility_reset:
+            Bweight = block_cut(self.weight.data, args.row_blocksize, args.column_blocksize)
+            num_blocks = Bweight.shape[0]
+            self.register_buffer('fur_last_deployed', self.weight.data.clone())
+            self.register_buffer('fur_prev_deployed', self.weight.data.clone())
+            self.register_buffer('fur_pending_delta', torch.zeros_like(self.weight.data))
+            self.register_buffer('fur_pending_valid', torch.tensor(False, dtype=torch.bool))
+            self.register_buffer('fur_flip_ema', torch.zeros(num_blocks))
+            self.register_buffer('fur_utility_ema', torch.zeros(num_blocks))
+            self.register_buffer('fur_utility_updates', torch.tensor(0, dtype=torch.long))
+            self.register_buffer('fur_total_resets', torch.tensor(0, dtype=torch.long))
+
+    def _future_utility_ready(self):
+        if not self.is_future_utility_reset or not self.is_ema:
+            return False
+        start_step = getattr(self.args, 'qlinear_future_utility_start_step', 0)
+        return self.ema_step >= max(10, start_step)
+
+    def _future_utility_rqweight(self):
+        """Return the exact Q-EMA deployed weight and cache it for DFUR."""
+        hard_weight = self._standard_rqweight(self.ema_weight)
+        if self.training:
+            with torch.no_grad():
+                self.fur_last_deployed.copy_(hard_weight.detach())
+        # Straight-through path for the latent master weight.
+        return hard_weight + (self.weight - self.weight.detach())
+
+    @torch.no_grad()
+    def update_future_utility_reset(self, global_step):
+        """Consume a one-step-delayed utility label and optionally reset blocks.
+
+        For a reset displacement delta saved at the preceding step, the current
+        synchronized gradient gives the first-order future utility
+        -<g_{t+1}, delta>.  Cosine normalization makes the score comparable
+        across layers and block scales.  Reset decisions are deterministic so
+        all DDP ranks remain identical.
+        """
+        if not (self.training and self._future_utility_ready()):
+            return None
+        if self.weight.grad is None:
+            return None
+
+        row_bs = self.args.row_blocksize
+        col_bs = self.args.column_blocksize
+        Bgrad = block_cut(self.weight.grad.detach(), row_bs, col_bs).float()
+        utility_decay = getattr(self.args, 'qlinear_future_utility_decay', 0.9)
+
+        utility = None
+        if bool(self.fur_pending_valid.item()):
+            Bdelta_prev = block_cut(self.fur_pending_delta, row_bs, col_bs).float()
+            dot = (Bgrad * Bdelta_prev).flatten(1).sum(dim=1)
+            gnorm = Bgrad.flatten(1).norm(dim=1)
+            dnorm = Bdelta_prev.flatten(1).norm(dim=1)
+            utility = -dot / (gnorm * dnorm).clamp_min(1e-12)
+            utility = torch.nan_to_num(utility, nan=0.0, posinf=0.0, neginf=0.0)
+            self.fur_utility_ema.mul_(utility_decay).add_(utility, alpha=1.0 - utility_decay)
+            self.fur_utility_updates.add_(1)
+
+        Bdeployed = block_cut(self.fur_last_deployed, row_bs, col_bs)
+        Bprev = block_cut(self.fur_prev_deployed, row_bs, col_bs)
+        flip = (Bdeployed != Bprev).float().flatten(1).mean(dim=1)
+        flip_decay = getattr(self.args, 'qlinear_future_flip_decay', 0.95)
+        self.fur_flip_ema.mul_(flip_decay).add_(flip, alpha=1.0 - flip_decay)
+
+        # Save the counterfactual displacement for the next batch before any
+        # live reset is applied at this step.
+        current_delta = self.fur_last_deployed - self.weight.data
+        self.fur_pending_delta.copy_(current_delta)
+        self.fur_pending_valid.fill_(True)
+        self.fur_prev_deployed.copy_(self.fur_last_deployed)
+
+        interval = max(1, getattr(self.args, 'qlinear_future_reset_interval', 200))
+        did_decide = (int(global_step) % interval == 0)
+        reset_mask = torch.zeros_like(self.fur_flip_ema, dtype=torch.bool)
+        candidate_mask = torch.zeros_like(reset_mask)
+        probabilities = torch.sigmoid(
+            self.fur_utility_ema
+            / max(getattr(self.args, 'qlinear_future_utility_tau', 0.1), 1e-6)
+        )
+
+        if did_decide and int(self.fur_utility_updates.item()) > 0:
+            num_blocks = self.fur_flip_ema.numel()
+            candidate_ratio = getattr(self.args, 'qlinear_future_candidate_ratio', 0.05)
+            budget_ratio = getattr(self.args, 'qlinear_future_budget_ratio', 0.01)
+            num_candidates = min(num_blocks, max(1, int(math.ceil(num_blocks * candidate_ratio))))
+            budget = min(num_candidates, max(1, int(math.ceil(num_blocks * budget_ratio))))
+
+            risk_values, risk_indices = torch.topk(self.fur_flip_ema, num_candidates)
+            active = risk_values > 0
+            if active.any():
+                active_indices = risk_indices[active]
+                candidate_mask[active_indices] = True
+                candidate_scores = self.fur_utility_ema[active_indices]
+                positive = candidate_scores > 0
+                if positive.any():
+                    positive_indices = active_indices[positive]
+                    positive_scores = self.fur_utility_ema[positive_indices]
+                    keep = min(budget, positive_indices.numel())
+                    selected = positive_indices[torch.topk(positive_scores, keep).indices]
+                    reset_mask[selected] = True
+
+        reset_count = int(reset_mask.sum().item())
+        if reset_count > 0:
+            Bweight = block_cut(self.weight.data, row_bs, col_bs).clone()
+            Bweight[reset_mask] = Bdeployed[reset_mask]
+            self.weight.data.copy_(block_reshape(Bweight, self.weight, row_bs, col_bs))
+            self.fur_total_resets.add_(reset_count)
+
+        if not did_decide:
+            return None
+
+        candidate_count = int(candidate_mask.sum().item())
+        positive_ratio = float((self.fur_utility_ema > 0).float().mean().item())
+        stats = {
+            'num_blocks': int(self.fur_flip_ema.numel()),
+            'candidate_count': candidate_count,
+            'reset_count': reset_count,
+            'total_resets': int(self.fur_total_resets.item()),
+            'flip_rate': float(flip.mean().item()),
+            'flip_ema_mean': float(self.fur_flip_ema.mean().item()),
+            'utility_mean': float(self.fur_utility_ema.mean().item()),
+            'utility_positive_ratio': positive_ratio,
+            'probability_mean': float(probabilities.mean().item()),
+            'utility_updates': int(self.fur_utility_updates.item()),
+        }
+        if reset_count > 0:
+            stats['reset_utility_mean'] = float(self.fur_utility_ema[reset_mask].mean().item())
+        else:
+            stats['reset_utility_mean'] = 0.0
+        if candidate_count > reset_count:
+            skipped = candidate_mask & ~reset_mask
+            stats['skipped_utility_mean'] = float(self.fur_utility_ema[skipped].mean().item())
+        else:
+            stats['skipped_utility_mean'] = 0.0
+        return stats
 
     def _osmq_ready(self):
         if not self.is_osmq or not self.is_ema:
@@ -345,7 +491,12 @@ class QLinearLayer(nn.Linear):
                         module.ema_weight.mul_(module.ema_decay) \
                                          .add_(module.weight.data, alpha = 1 - module.ema_decay)
         """
-        if self.apply_quantize and self._osmq_ready():
+        if self.apply_quantize and self._future_utility_ready():
+            rqweight = self._future_utility_rqweight()
+            output = QuantLinearWithRQWeight.apply(input,
+                                    rqweight, self.bias,
+                                    self.args, self.layer_name, self.apply_quantize)
+        elif self.apply_quantize and self._osmq_ready():
             rqweight = self._osmq_rqweight()
             output = QuantLinearWithRQWeight.apply(input,
                                     rqweight, self.bias,

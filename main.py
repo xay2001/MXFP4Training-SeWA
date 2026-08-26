@@ -275,6 +275,24 @@ def get_args_parser():
                        help='Collect scale monitoring statistics every N global training steps.')
     group.add_argument('--qlinear-scale-monitor-path', type=str, default='',
                        help='Path to the scale monitor jsonl file. Empty means <output_dir>/scale_monitor.jsonl.')
+    group.add_argument('--qlinear-future-utility-reset', action='store_true', default=False,
+                       help='Enable delayed future-utility selective reset on top of Q-EMA.')
+    group.add_argument('--qlinear-future-utility-start-step', type=int, default=50000,
+                       help='Training step at which future-utility tracking and reset start.')
+    group.add_argument('--qlinear-future-reset-interval', type=int, default=200,
+                       help='Apply a sparse reset decision every N training steps.')
+    group.add_argument('--qlinear-future-candidate-ratio', type=float, default=0.05,
+                       help='Fraction of highest flip-risk blocks eligible for reset.')
+    group.add_argument('--qlinear-future-budget-ratio', type=float, default=0.01,
+                       help='Maximum fraction of all blocks reset at one decision.')
+    group.add_argument('--qlinear-future-utility-decay', type=float, default=0.9,
+                       help='EMA decay for delayed counterfactual utility.')
+    group.add_argument('--qlinear-future-flip-decay', type=float, default=0.95,
+                       help='EMA decay for per-block deployed-code flip risk.')
+    group.add_argument('--qlinear-future-utility-tau', type=float, default=0.1,
+                       help='Temperature used to expose probabilistic utility-mask statistics.')
+    group.add_argument('--qlinear-future-monitor-path', type=str, default='',
+                       help='DFUR JSONL path. Empty means <output_dir>/future_utility_monitor.jsonl.')
     
     return parser
 

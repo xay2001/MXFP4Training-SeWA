@@ -72,6 +72,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
 
     base_model = model.module if hasattr(model, 'module') else model
 
+    future_utility_monitor_path = getattr(args, 'qlinear_future_monitor_path', '') or \
+        os.path.join(args.output_dir, 'future_utility_monitor.jsonl')
+    if getattr(args, 'qlinear_future_utility_reset', False) and utils.is_main_process():
+        os.makedirs(os.path.dirname(future_utility_monitor_path), exist_ok=True)
+
     scale_monitor = getattr(args, 'qlinear_scale_monitor', False)
     scale_monitor_interval = max(1, getattr(args, 'qlinear_scale_monitor_interval', 500))
     scale_monitor_path = getattr(args, 'qlinear_scale_monitor_path', '') or \
@@ -106,6 +111,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
             f.write(json.dumps(record) + "\n")
     
     for step, (samples, targets) in metric_logger.log_every(data_loader, print_freq, header):
+        global_step = epoch * len(data_loader) + step
         if "BSRamping" in args.opt and step % CALIBRATE_PERIOD == 0:
             assert max_norm is None, "Only Support no-grad_clipping !!"
             print(f"start calibration of element-wise BSRamping at [epoch#{epoch} step#{step}/{len(data_loader)}]!!!")
@@ -153,6 +159,27 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
                     parameters=model.parameters(), create_graph=is_second_order)
 
         torch.cuda.synchronize()
+
+        # DFUR consumes the synchronized gradient from this batch as a
+        # one-step-delayed counterfactual label, then optionally applies a
+        # deterministic sparse reset to the just-updated live master weights.
+        future_utility_layers = {}
+        if getattr(args, 'qlinear_future_utility_reset', False):
+            for name, module in base_model.named_modules():
+                if isinstance(module, QLinearLayer) and getattr(module, 'is_future_utility_reset', False):
+                    stats = module.update_future_utility_reset(global_step)
+                    if stats is not None:
+                        future_utility_layers[name] = stats
+            if future_utility_layers and utils.is_main_process():
+                record = {
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'method': 'delayed_future_utility_reset',
+                    'layers': future_utility_layers,
+                }
+                with open(future_utility_monitor_path, 'a') as f:
+                    f.write(json.dumps(record) + '\n')
+
         if model_ema is not None:
             model_ema.update(model)
         
@@ -218,7 +245,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: DistillationLoss,
         }
         if scale_loss_value is not None:
             step_summary["scale_loss"] = scale_loss_value
-        global_step = epoch * len(data_loader) + step
         DLLogger.log(step=global_step,
                      data=step_summary, verbosity=0)
 
